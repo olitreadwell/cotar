@@ -7,6 +7,16 @@ import { IndexHeaderSize, IndexMagic, IndexV2RecordSize } from './format.js';
 const Big32 = BigInt(32);
 const BigUint32Max = BigInt(2 ** 32 - 1);
 
+/**
+ * Number of records to read from the index in a single request while probing.
+ *
+ * The builder keeps every file within `maxSearch` (default 256) slots of its
+ * home slot, so one block of this size almost always covers the whole probe
+ * run. Reading a block at a time makes a lookup a single range request instead
+ * of one request per slot. 256 records is 4KB (256 * 16 bytes).
+ */
+const SearchRecordBlock = 256;
+
 export function readMetadata(bytes: ArrayBuffer): CotarMetadata {
   const buf = new DataView(bytes);
   // Read the first three bytes as magic 'COT' string
@@ -100,23 +110,33 @@ export class CotarIndex {
     // working with u64 is sometimes hard, split into two u32s
     const hashHigh = Number(hash >> Big32);
     const hashLow = Number(hash & BigUint32Max);
-    let startHashHigh: number | null | undefined = null;
-    let startHashLow: number | null | undefined = null;
 
     let index = startIndex;
-    while (true) {
-      const offset = this.sourceOffset + index * IndexV2RecordSize + IndexHeaderSize;
-      const bytes = await this.source.fetch(offset, IndexV2RecordSize);
-      const view = new Uint32Array(bytes);
+    // Block of records currently loaded from the source, and the slot it starts at.
+    // Each record is 4 uint32s, so `block` holds `block.length / 4` records.
+    let block: Uint32Array | null = null;
+    let blockStart = 0;
 
-      startHashLow = view[0];
-      startHashHigh = view[1];
+    while (true) {
+      // Read a new block whenever the wanted slot is past the loaded one.
+      // Probing only moves forward; wrapping resets `block` to null below.
+      if (block == null || index >= blockStart + block.length / 4) {
+        const recordCount = Math.min(SearchRecordBlock, slotCount - index);
+        const offset = this.sourceOffset + index * IndexV2RecordSize + IndexHeaderSize;
+        const bytes = await this.source.fetch(offset, recordCount * IndexV2RecordSize);
+        block = new Uint32Array(bytes);
+        blockStart = index;
+      }
+
+      const recordAt = (index - blockStart) * 4;
+      const startHashLow = block[recordAt];
+      const startHashHigh = block[recordAt + 1];
 
       // Found the file
       if (startHashHigh === hashHigh && startHashLow === hashLow) {
         // Tar offsets are block aligned to 512byte blocks
-        const fileOffset = (view[2] as number) * 512;
-        const fileSize = view[3];
+        const fileOffset = (block[recordAt + 2] as number) * 512;
+        const fileSize = block[recordAt + 3];
         return { offset: fileOffset, size: fileSize as number };
       }
       // Found a gap in the hash table (file doesn't exist)
@@ -124,7 +144,11 @@ export class CotarIndex {
 
       index++;
       // Loop around if we hit the end of the hash table
-      if (index >= slotCount) index = 0;
+      if (index >= slotCount) {
+        index = 0;
+        // The next block cannot continue past the end, force a fresh read.
+        block = null;
+      }
       if (index === startIndex) return null;
     }
   }
